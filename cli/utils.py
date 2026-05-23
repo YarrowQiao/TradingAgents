@@ -178,8 +178,32 @@ def _fetch_openrouter_models() -> List[Tuple[str, str]]:
         return []
 
 
-def select_openrouter_model() -> str:
-    """Select an OpenRouter model from the newest available, or enter a custom ID."""
+def select_openrouter_model(mode: str = "") -> str:
+    """Select an OpenRouter model from the newest available, or enter a custom ID.
+
+    When ``TRADINGAGENTS_LLM_BACKEND_URL`` points at a loopback proxy
+    (e.g., the bundled claude-proxy on 127.0.0.1), the openrouter.ai
+    catalog doesn't apply — those endpoints expose their own model
+    names. Skip the network fetch in that case and prompt directly,
+    prefilled from the matching TRADINGAGENTS_*_THINK_LLM env var so
+    one Enter accepts the configured default.
+    """
+    backend = os.environ.get("TRADINGAGENTS_LLM_BACKEND_URL", "")
+    is_local = backend.startswith(("http://127.", "http://localhost", "http://0.0.0.0"))
+
+    if is_local:
+        env_var = {
+            "quick": "TRADINGAGENTS_QUICK_THINK_LLM",
+            "deep":  "TRADINGAGENTS_DEEP_THINK_LLM",
+        }.get(mode)
+        default = os.environ.get(env_var, "") if env_var else ""
+        prompt_label = f"Enter local model ID ({mode}-thinking):" if mode else "Enter local model ID:"
+        return questionary.text(
+            prompt_label,
+            default=default,
+            validate=lambda x: len(x.strip()) > 0 or "Please enter a model ID.",
+        ).ask().strip()
+
     models = _fetch_openrouter_models()
 
     choices = [questionary.Choice(name, value=mid) for name, mid in models[:5]]
@@ -216,7 +240,7 @@ def _prompt_custom_model_id() -> str:
 def _select_model(provider: str, mode: str) -> str:
     """Select a model for the given provider and mode (quick/deep)."""
     if provider.lower() == "openrouter":
-        return select_openrouter_model()
+        return select_openrouter_model(mode)
 
     if provider.lower() == "azure":
         return questionary.text(
@@ -275,10 +299,19 @@ def select_llm_provider() -> tuple[str, str | None]:
         ("Qwen", "qwen", "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"),
         ("GLM", "glm", "https://open.bigmodel.cn/api/paas/v4/"),
         ("MiniMax", "minimax", "https://api.minimax.io/v1"),
-        ("OpenRouter", "openrouter", "https://openrouter.ai/api/v1"),
+        ("OpenRouter", "openrouter", os.environ.get("TRADINGAGENTS_LLM_BACKEND_URL") or "https://openrouter.ai/api/v1"),
         ("Azure OpenAI", "azure", None),
         ("Ollama", "ollama", ollama_url),
     ]
+
+    # Pre-select the provider named in .env so the common case is one Enter
+    # away. The default must be the *exact* tuple stored as the Choice value;
+    # questionary matches by value identity, not by provider_key alone.
+    default_provider_key = os.environ.get("TRADINGAGENTS_LLM_PROVIDER", "").lower()
+    default_value = next(
+        ((pk, url) for _, pk, url in PROVIDERS if pk == default_provider_key),
+        None,
+    )
 
     choice = questionary.select(
         "Select your LLM Provider:",
@@ -286,6 +319,7 @@ def select_llm_provider() -> tuple[str, str | None]:
             questionary.Choice(display, value=(provider_key, url))
             for display, provider_key, url in PROVIDERS
         ],
+        default=default_value,
         instruction="\n- Use arrow keys to navigate\n- Press Enter to select",
         style=questionary.Style(
             [

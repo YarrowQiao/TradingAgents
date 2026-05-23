@@ -1,5 +1,9 @@
 from typing import Optional
 import datetime
+import os
+import shutil
+import subprocess
+import tempfile
 import typer
 import questionary
 from pathlib import Path
@@ -681,93 +685,208 @@ def get_analysis_date():
             )
 
 
+# LaTeX header injected at PDF time. Microsoft YaHei has no glyphs for the
+# emoji and dingbat codepoints the analysts emit (colored circles, check
+# marks, finance icons), so xelatex would otherwise render them as missing
+# squares. `newunicodechar` reroutes each known codepoint through Segoe UI
+# Emoji / Segoe UI Symbol (both ship with Windows 11). Rendering is
+# monochrome outline — xelatex doesn't do color emoji — which is acceptable
+# tradeoff vs. losing the glyph entirely. Add new mappings here when the
+# pandoc log starts warning about a previously-unseen U+XXXX.
+_EMOJI_FALLBACK_TEX = r"""\usepackage{newunicodechar}
+\newfontfamily\emojifont{Segoe UI Emoji}
+\newfontfamily\symbolfont{Segoe UI Symbol}
+\newunicodechar{🔴}{{\emojifont 🔴}}
+\newunicodechar{🟢}{{\emojifont 🟢}}
+\newunicodechar{🟡}{{\emojifont 🟡}}
+\newunicodechar{🟠}{{\emojifont 🟠}}
+\newunicodechar{⚪}{{\emojifont ⚪}}
+\newunicodechar{🔵}{{\emojifont 🔵}}
+\newunicodechar{✅}{{\emojifont ✅}}
+\newunicodechar{❌}{{\emojifont ❌}}
+\newunicodechar{✓}{{\symbolfont ✓}}
+\newunicodechar{✗}{{\symbolfont ✗}}
+\newunicodechar{⚠}{{\symbolfont ⚠}}
+\newunicodechar{❓}{{\emojifont ❓}}
+\newunicodechar{❔}{{\emojifont ❔}}
+\newunicodechar{🎯}{{\emojifont 🎯}}
+\newunicodechar{📊}{{\emojifont 📊}}
+\newunicodechar{📈}{{\emojifont 📈}}
+\newunicodechar{📉}{{\emojifont 📉}}
+\newunicodechar{💡}{{\emojifont 💡}}
+\newunicodechar{💰}{{\emojifont 💰}}
+\newunicodechar{💚}{{\emojifont 💚}}
+\newunicodechar{🌍}{{\emojifont 🌍}}
+\newunicodechar{🛑}{{\emojifont 🛑}}
+\newunicodechar{🔍}{{\emojifont 🔍}}
+\newunicodechar{📋}{{\emojifont 📋}}
+\newunicodechar{📰}{{\emojifont 📰}}
+\newunicodechar{💼}{{\emojifont 💼}}
+\newunicodechar{🚀}{{\emojifont 🚀}}
+\newunicodechar{⭐}{{\emojifont ⭐}}
+\newunicodechar{➜}{{\symbolfont ➜}}
+% VARIATION SELECTOR-16 controls emoji presentation; invisible and ignorable
+% in a PDF context. Map to empty to silence the xelatex missing-glyph warning.
+\newunicodechar{️}{}
+"""
+
+
+def _resolve_pandoc() -> Optional[str]:
+    """Locate pandoc.exe even when PATH is stale.
+
+    A common failure mode on Windows: pandoc is winget-installed at
+    user scope after the current shell already started, so PATH is
+    frozen without it. shutil.which then returns None and the PDF
+    silently doesn't generate. Fall back to the two default install
+    locations before giving up.
+    """
+    found = shutil.which("pandoc")
+    if found:
+        return found
+    candidates = [
+        Path(os.environ.get("LOCALAPPDATA", "")) / "Pandoc" / "pandoc.exe",
+        Path(r"C:\Program Files\Pandoc\pandoc.exe"),
+    ]
+    for c in candidates:
+        if c.is_file():
+            return str(c)
+    return None
+
+
+def _convert_md_to_pdf(md_path: Path) -> Optional[Path]:
+    """Best-effort MD -> PDF via pandoc+xelatex; CJK via Microsoft YaHei.
+
+    Skips silently if pandoc isn't installed. Failures do not propagate —
+    a missing PDF must not invalidate the markdown report that already
+    saved successfully.
+    """
+    pandoc = _resolve_pandoc()
+    if pandoc is None:
+        console.print(
+            "[yellow]Skipping PDF (pandoc not found). "
+            "Install via `winget install JohnMacFarlane.Pandoc` to enable.[/yellow]"
+        )
+        return None
+    pdf_path = md_path.with_suffix(".pdf")
+    # Stage the emoji fallback header to a temp .tex file; pandoc reads it
+    # via --include-in-header and weaves the newunicodechar rerouting into
+    # the generated LaTeX preamble before xelatex compiles.
+    header_fd, header_name = tempfile.mkstemp(suffix=".tex", text=True)
+    try:
+        with os.fdopen(header_fd, "w", encoding="utf-8") as f:
+            f.write(_EMOJI_FALLBACK_TEX)
+        cmd = [
+            pandoc,
+            str(md_path),
+            "-o", str(pdf_path),
+            "--pdf-engine=xelatex",
+            "-V", "CJKmainfont=Microsoft YaHei",
+            "-V", "mainfont=Microsoft YaHei",
+            "-V", "geometry:margin=2cm",
+            "--include-in-header", header_name,
+        ]
+        try:
+            # encoding+errors guard against pandoc's UTF-8 stderr being decoded
+            # with the legacy GBK codepage on Chinese-locale Windows (the
+            # default for text=True when LANG/PYTHONIOENCODING aren't set),
+            # which raises UnicodeDecodeError in a background reader thread.
+            subprocess.run(
+                cmd,
+                check=True,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+            return pdf_path
+        except subprocess.CalledProcessError as e:
+            tail = (e.stderr or "")[-400:]
+            console.print(
+                f"[yellow]PDF conversion failed (md still saved):\n{tail}[/yellow]"
+            )
+            return None
+    finally:
+        try:
+            os.unlink(header_name)
+        except OSError:
+            pass
+
+
 def save_report_to_disk(final_state, ticker: str, save_path: Path):
-    """Save complete analysis report to disk with organized subfolders."""
+    """Save analysis output to disk: per-agent .md files in numbered subfolders,
+    plus a consolidated complete_report.md/.pdf and a lite <folder>+股票分析.md/.pdf.
+
+    The consolidated docs are assembled by cli.lite_report so both versions
+    share one heading layout (folder name as H1, role as H2, file content
+    demoted underneath) — keeps the two outputs visually consistent and
+    avoids the heading-level collisions of naive .md concatenation.
+    """
     save_path.mkdir(parents=True, exist_ok=True)
-    sections = []
 
-    # 1. Analysts
+    # 1. Analysts — one .md per analyst that emitted output.
     analysts_dir = save_path / "1_analysts"
-    analyst_parts = []
-    if final_state.get("market_report"):
-        analysts_dir.mkdir(exist_ok=True)
-        (analysts_dir / "market.md").write_text(final_state["market_report"], encoding="utf-8")
-        analyst_parts.append(("Market Analyst", final_state["market_report"]))
-    if final_state.get("sentiment_report"):
-        analysts_dir.mkdir(exist_ok=True)
-        (analysts_dir / "sentiment.md").write_text(final_state["sentiment_report"], encoding="utf-8")
-        analyst_parts.append(("Sentiment Analyst", final_state["sentiment_report"]))
-    if final_state.get("news_report"):
-        analysts_dir.mkdir(exist_ok=True)
-        (analysts_dir / "news.md").write_text(final_state["news_report"], encoding="utf-8")
-        analyst_parts.append(("News Analyst", final_state["news_report"]))
-    if final_state.get("fundamentals_report"):
-        analysts_dir.mkdir(exist_ok=True)
-        (analysts_dir / "fundamentals.md").write_text(final_state["fundamentals_report"], encoding="utf-8")
-        analyst_parts.append(("Fundamentals Analyst", final_state["fundamentals_report"]))
-    if analyst_parts:
-        content = "\n\n".join(f"### {name}\n{text}" for name, text in analyst_parts)
-        sections.append(f"## I. Analyst Team Reports\n\n{content}")
+    for key, fname in (
+        ("market_report",       "market.md"),
+        ("sentiment_report",    "sentiment.md"),
+        ("news_report",         "news.md"),
+        ("fundamentals_report", "fundamentals.md"),
+    ):
+        if final_state.get(key):
+            analysts_dir.mkdir(exist_ok=True)
+            (analysts_dir / fname).write_text(final_state[key], encoding="utf-8")
 
-    # 2. Research
+    # 2. Research debate (bull vs bear, plus manager's judgement).
     if final_state.get("investment_debate_state"):
-        research_dir = save_path / "2_research"
         debate = final_state["investment_debate_state"]
-        research_parts = []
-        if debate.get("bull_history"):
-            research_dir.mkdir(exist_ok=True)
-            (research_dir / "bull.md").write_text(debate["bull_history"], encoding="utf-8")
-            research_parts.append(("Bull Researcher", debate["bull_history"]))
-        if debate.get("bear_history"):
-            research_dir.mkdir(exist_ok=True)
-            (research_dir / "bear.md").write_text(debate["bear_history"], encoding="utf-8")
-            research_parts.append(("Bear Researcher", debate["bear_history"]))
-        if debate.get("judge_decision"):
-            research_dir.mkdir(exist_ok=True)
-            (research_dir / "manager.md").write_text(debate["judge_decision"], encoding="utf-8")
-            research_parts.append(("Research Manager", debate["judge_decision"]))
-        if research_parts:
-            content = "\n\n".join(f"### {name}\n{text}" for name, text in research_parts)
-            sections.append(f"## II. Research Team Decision\n\n{content}")
+        research_dir = save_path / "2_research"
+        for key, fname in (
+            ("bull_history",   "bull.md"),
+            ("bear_history",   "bear.md"),
+            ("judge_decision", "manager.md"),
+        ):
+            if debate.get(key):
+                research_dir.mkdir(exist_ok=True)
+                (research_dir / fname).write_text(debate[key], encoding="utf-8")
 
-    # 3. Trading
+    # 3. Trading plan.
     if final_state.get("trader_investment_plan"):
         trading_dir = save_path / "3_trading"
         trading_dir.mkdir(exist_ok=True)
-        (trading_dir / "trader.md").write_text(final_state["trader_investment_plan"], encoding="utf-8")
-        sections.append(f"## III. Trading Team Plan\n\n### Trader\n{final_state['trader_investment_plan']}")
+        (trading_dir / "trader.md").write_text(
+            final_state["trader_investment_plan"], encoding="utf-8"
+        )
 
-    # 4. Risk Management
+    # 4. Risk committee + 5. Portfolio manager (both live under risk_debate_state).
     if final_state.get("risk_debate_state"):
-        risk_dir = save_path / "4_risk"
         risk = final_state["risk_debate_state"]
-        risk_parts = []
-        if risk.get("aggressive_history"):
-            risk_dir.mkdir(exist_ok=True)
-            (risk_dir / "aggressive.md").write_text(risk["aggressive_history"], encoding="utf-8")
-            risk_parts.append(("Aggressive Analyst", risk["aggressive_history"]))
-        if risk.get("conservative_history"):
-            risk_dir.mkdir(exist_ok=True)
-            (risk_dir / "conservative.md").write_text(risk["conservative_history"], encoding="utf-8")
-            risk_parts.append(("Conservative Analyst", risk["conservative_history"]))
-        if risk.get("neutral_history"):
-            risk_dir.mkdir(exist_ok=True)
-            (risk_dir / "neutral.md").write_text(risk["neutral_history"], encoding="utf-8")
-            risk_parts.append(("Neutral Analyst", risk["neutral_history"]))
-        if risk_parts:
-            content = "\n\n".join(f"### {name}\n{text}" for name, text in risk_parts)
-            sections.append(f"## IV. Risk Management Team Decision\n\n{content}")
-
-        # 5. Portfolio Manager
+        risk_dir = save_path / "4_risk"
+        for key, fname in (
+            ("aggressive_history",   "aggressive.md"),
+            ("conservative_history", "conservative.md"),
+            ("neutral_history",      "neutral.md"),
+        ):
+            if risk.get(key):
+                risk_dir.mkdir(exist_ok=True)
+                (risk_dir / fname).write_text(risk[key], encoding="utf-8")
         if risk.get("judge_decision"):
             portfolio_dir = save_path / "5_portfolio"
             portfolio_dir.mkdir(exist_ok=True)
-            (portfolio_dir / "decision.md").write_text(risk["judge_decision"], encoding="utf-8")
-            sections.append(f"## V. Portfolio Manager Decision\n\n### Portfolio Manager\n{risk['judge_decision']}")
+            (portfolio_dir / "decision.md").write_text(
+                risk["judge_decision"], encoding="utf-8"
+            )
 
-    # Write consolidated report
-    header = f"# Trading Analysis Report: {ticker}\n\nGenerated: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-    (save_path / "complete_report.md").write_text(header + "\n\n".join(sections), encoding="utf-8")
+    # Consolidated reports — both full and lite use the same assembly logic
+    # in cli.lite_report so their heading styles stay in sync.
+    from cli.lite_report import generate_full_for_folder, generate_lite_for_folder
+
+    full_pdf = generate_full_for_folder(save_path)
+    if full_pdf:
+        console.print(f"[green]PDF report saved to:[/green] {full_pdf}")
+
+    lite_pdf = generate_lite_for_folder(save_path)
+    if lite_pdf:
+        console.print(f"[green]Lite PDF saved to:[/green] {lite_pdf}")
+
     return save_path / "complete_report.md"
 
 
