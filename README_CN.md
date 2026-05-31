@@ -90,7 +90,7 @@ cd c:\Users\HP\Desktop\Agent\TradingAgents
 .\.venv\Scripts\Activate.ps1
 
 # 方式 A — 交互式 CLI（选股票、选分析师、选日期）
-tradingagents
+tradingagents --checkpoint
 
 # 方式 B — 用 main.py 默认分析 NVDA 2024-05-10
 python main.py
