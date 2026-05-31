@@ -1,0 +1,87 @@
+{
+  "name": "openclaw-claude-proxy",
+  "version": "1.0.8",
+  "description": "OpenClaw-oriented local Claude Code proxy with OpenAI-compatible chat, responses, streaming, tools, traces, and release-ready packaging.",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "claude-proxy": "dist/server/standalone.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "start": "node dist/server/standalone.js",
+    "update-pricing": "node scripts/update-pricing.mjs",
+    "test": "node --test dist/**/*.test.js",
+    "soak": "node scripts/soak.mjs",
+    "soak:quick": "SOAK_CONCURRENCY=1 node scripts/soak.mjs",
+    "clean": "rm -rf dist",
+    "prepublishOnly": "npm run build",
+    "canary:stream-json": "npm run build && node scripts/canary-stream-json.mjs",
+    "sdk:matrix": "node scripts/sdk-matrix.mjs",
+    "verify:live": "npm run soak:quick && npm run canary:stream-json && npm run sdk:matrix && npm run failure:sim",
+    "failure:sim": "node scripts/failure-sim.mjs",
+    "monitor:live": "node scripts/live-monitor.mjs",
+    "setup:sdk-matrix": "npm install && python3 -m venv .venv-sdk-matrix && .venv-sdk-matrix/bin/python -m pip install --upgrade pip openai"
+  },
+  "keywords": [
+    "claude",
+    "anthropic",
+    "claude-code",
+    "claude-max",
+    "openai-compatible",
+    "api-server",
+    "oauth",
+    "clawdbot",
+    "llm",
+    "ai",
+    "openclaw",
+    "claude-proxy"
+  ],
+  "author": "mehdic",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mehdic/openclaw-claude-proxy.git"
+  },
+  "bugs": {
+    "url": "https://github.com/mehdic/openclaw-claude-proxy/issues"
+  },
+  "homepage": "https://github.com/mehdic/openclaw-claude-proxy#readme",
+  "dependencies": {
+    "express": "^4.21.2",
+    "uuid": "^14.0.0"
+  },
+  "devDependencies": {
+    "@langchain/core": "^1.1.42",
+    "@langchain/openai": "^1.4.5",
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.10.7",
+    "openai": "^6.35.0",
+    "typescript": "^5.7.3"
+  },
+  "peerDependencies": {
+    "clawdbot": ">=2026.1.0"
+  },
+  "peerDependenciesMeta": {
+    "clawdbot": {
+      "optional": true
+    }
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "files": [
+    "dist",
+    "docs",
+    "scripts",
+    "README.md",
+    "CONTRIBUTING.md",
+    "!dist/__tests__",
+    "!dist/**/*.test.js",
+    "!dist/**/*.test.js.map",
+    "!dist/**/*.test.d.ts",
+    "!dist/**/*.test.d.ts.map"
+  ]
+}

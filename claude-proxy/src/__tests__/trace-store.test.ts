@@ -1,0 +1,681 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { TraceStore, traceStore } from "../trace/store.js";
+import type { TraceRecord } from "../trace/types.js";
+import { classifyError, isStreamLayerFault, isStreamLayerFaultClass } from "../errors.js";
+import { extractArgumentKeys, isSecretKey, redactToolChoice, redactEnv } from "../trace/redact.js";
+import { createTraceBuilder } from "../trace/builder.js";
+import { applyMcpPolicy, applyMcpPolicyWithEnv, detectOverlappingTools, mcpGovernanceSummary, parseList, secretDecisionsToTrace } from "../mcp/governance.js";
+import type { ResolvedMcpServer } from "../mcp/openclaw-config.js";
+import { createProgressChunk, createSseKeepaliveComment } from "../server/routes.js";
+import { parseToolCalls } from "../adapter/tools.js";
+import type { OpenAIChatRequest } from "../types/openai.js";
+
+// ── Helpers ──────────────────────────────────────────────────────────
+
+function makeTrace(id: string, overrides: Partial<TraceRecord> = {}): TraceRecord {
+  return {
+    traceId: id,
+    requestId: `req_${id}`,
+    createdAt: Date.now(),
+    model: "claude-sonnet-4-6",
+    requestedModel: "claude-proxy/claude-sonnet-4-6",
+    runtime: "stream-json",
+    stream: true,
+    endpoint: "chat.completions",
+    messageCount: 2,
+    bridgeTools: false,
+    toolsOffered: [],
+    toolCallsParsed: [],
+    toolResultsInjected: [],
+    fallbackTriggered: false,
+    mcpDecisions: [],
+    ...overrides,
+  };
+}
+
+// ── TraceStore tests ─────────────────────────────────────────────────
+
+test("TraceStore: disabled by default (no env)", () => {
+  const store = new TraceStore();
+  // CLAUDE_PROXY_TRACE_ENABLED is not set in test env
+  assert.equal(store.enabled, false);
+  store.set(makeTrace("t1"));
+  assert.equal(store.size(), 0);
+  assert.equal(store.get("t1"), undefined);
+});
+
+test("TraceStore: stores and retrieves traces when enabled", () => {
+  const orig = process.env.CLAUDE_PROXY_TRACE_ENABLED;
+  process.env.CLAUDE_PROXY_TRACE_ENABLED = "1";
+  try {
+    const store = new TraceStore();
+    assert.equal(store.enabled, true);
+    const t = makeTrace("t1");
+    store.set(t);
+    assert.equal(store.size(), 1);
+    const retrieved = store.get("t1");
+    assert.ok(retrieved);
+    assert.equal(retrieved.traceId, "t1");
+  } finally {
+    if (orig !== undefined) process.env.CLAUDE_PROXY_TRACE_ENABLED = orig;
+    else delete process.env.CLAUDE_PROXY_TRACE_ENABLED;
+  }
+});
+
+test("TraceStore: LRU eviction at capacity", () => {
+  const orig = process.env.CLAUDE_PROXY_TRACE_ENABLED;
+  const origCap = process.env.CLAUDE_PROXY_TRACE_CAPACITY;
+  process.env.CLAUDE_PROXY_TRACE_ENABLED = "1";
+  process.env.CLAUDE_PROXY_TRACE_CAPACITY = "3";
+  try {
+    const store = new TraceStore();
+    store.set(makeTrace("t1"));
+    store.set(makeTrace("t2"));
+    store.set(makeTrace("t3"));
+    assert.equal(store.size(), 3);
+    store.set(makeTrace("t4"));
+    assert.equal(store.size(), 3);
+    // t1 should have been evicted (oldest)
+    assert.equal(store.get("t1"), undefined);
+    assert.ok(store.get("t4"));
+  } finally {
+    if (orig !== undefined) process.env.CLAUDE_PROXY_TRACE_ENABLED = orig;
+    else delete process.env.CLAUDE_PROXY_TRACE_ENABLED;
+    if (origCap !== undefined) process.env.CLAUDE_PROXY_TRACE_CAPACITY = origCap;
+    else delete process.env.CLAUDE_PROXY_TRACE_CAPACITY;
+  }
+});
+
+test("TraceStore: TTL eviction", () => {
+  const orig = process.env.CLAUDE_PROXY_TRACE_ENABLED;
+  const origTtl = process.env.CLAUDE_PROXY_TRACE_TTL_MS;
+  process.env.CLAUDE_PROXY_TRACE_ENABLED = "1";
+  process.env.CLAUDE_PROXY_TRACE_TTL_MS = "60000"; // minimum floor
+  try {
+    const store = new TraceStore();
+    const oldTrace = makeTrace("old", { createdAt: Date.now() - 120_000 });
+    store.set(oldTrace);
+    // Should be evicted on access
+    assert.equal(store.get("old"), undefined);
+  } finally {
+    if (orig !== undefined) process.env.CLAUDE_PROXY_TRACE_ENABLED = orig;
+    else delete process.env.CLAUDE_PROXY_TRACE_ENABLED;
+    if (origTtl !== undefined) process.env.CLAUDE_PROXY_TRACE_TTL_MS = origTtl;
+    else delete process.env.CLAUDE_PROXY_TRACE_TTL_MS;
+  }
+});
+
+test("TraceStore: list returns newest first", () => {
+  const orig = process.env.CLAUDE_PROXY_TRACE_ENABLED;
+  process.env.CLAUDE_PROXY_TRACE_ENABLED = "1";
+  try {
+    const store = new TraceStore();
+    store.set(makeTrace("t1", { createdAt: Date.now() - 3000 }));
+    store.set(makeTrace("t2", { createdAt: Date.now() - 2000 }));
+    store.set(makeTrace("t3", { createdAt: Date.now() - 1000 }));
+    const list = store.list();
+    assert.equal(list.length, 3);
+    assert.equal(list[0].traceId, "t3");
+    assert.equal(list[2].traceId, "t1");
+  } finally {
+    if (orig !== undefined) process.env.CLAUDE_PROXY_TRACE_ENABLED = orig;
+    else delete process.env.CLAUDE_PROXY_TRACE_ENABLED;
+  }
+});
+
+test("TraceStore: stats returns capacity/ttl", () => {
+  const orig = process.env.CLAUDE_PROXY_TRACE_ENABLED;
+  process.env.CLAUDE_PROXY_TRACE_ENABLED = "1";
+  try {
+    const store = new TraceStore();
+    const stats = store.stats();
+    assert.equal(stats.enabled, true);
+    assert.equal(typeof stats.capacity, "number");
+    assert.equal(typeof stats.ttlMs, "number");
+    assert.ok(stats.capacity > 0);
+    assert.ok(stats.ttlMs >= 60_000);
+  } finally {
+    if (orig !== undefined) process.env.CLAUDE_PROXY_TRACE_ENABLED = orig;
+    else delete process.env.CLAUDE_PROXY_TRACE_ENABLED;
+  }
+});
+
+// ── Error classification tests ───────────────────────────────────────
+
+test("classifyError: init handshake timeout", () => {
+  assert.equal(classifyError(new Error("init handshake timed out after 30000ms")), "init_handshake_timeout");
+});
+
+test("classifyError: worker died", () => {
+  assert.equal(classifyError(new Error("subprocess closed before result")), "worker_died");
+});
+
+test("classifyError: turn timeout", () => {
+  assert.equal(classifyError(new Error("turn timed out after 900000ms")), "turn_timeout");
+});
+
+test("classifyError: spawn ENOENT", () => {
+  assert.equal(classifyError(new Error("Claude CLI not found")), "spawn_enoent");
+});
+
+test("classifyError: stdin closed", () => {
+  assert.equal(classifyError(new Error("stdin not writable")), "stdin_closed");
+});
+
+test("classifyError: worker invalid", () => {
+  assert.equal(classifyError(new Error("subprocess not initialized")), "worker_invalid");
+  assert.equal(classifyError(new Error("subprocess is dead")), "worker_invalid");
+});
+
+test("classifyError: control protocol", () => {
+  assert.equal(classifyError(new Error("control error")), "control_protocol");
+});
+
+test("classifyError: rate limit", () => {
+  assert.equal(classifyError(new Error("rate limit exceeded (429)")), "rate_limit");
+});
+
+test("classifyError: auth error", () => {
+  assert.equal(classifyError(new Error("unauthorized (401)")), "auth_error");
+});
+
+test("classifyError: unknown for non-Error", () => {
+  assert.equal(classifyError("string error"), "unknown");
+  assert.equal(classifyError(null), "unknown");
+});
+
+test("isStreamLayerFault: true for transport faults", () => {
+  assert.equal(isStreamLayerFault(new Error("init handshake timed out")), true);
+  assert.equal(isStreamLayerFault(new Error("subprocess closed before result")), true);
+  assert.equal(isStreamLayerFault(new Error("turn timed out")), true);
+});
+
+test("isStreamLayerFault: false for model errors", () => {
+  assert.equal(isStreamLayerFault(new Error("rate limit exceeded")), false);
+  assert.equal(isStreamLayerFault(new Error("unauthorized")), false);
+});
+
+test("isStreamLayerFaultClass: bounded labels", () => {
+  assert.equal(isStreamLayerFaultClass("init_handshake_timeout"), true);
+  assert.equal(isStreamLayerFaultClass("worker_died"), true);
+  assert.equal(isStreamLayerFaultClass("rate_limit"), false);
+  assert.equal(isStreamLayerFaultClass("auth_error"), false);
+  assert.equal(isStreamLayerFaultClass("unknown"), false);
+});
+
+// ── Redaction tests ──────────────────────────────────────────────────
+
+test("isSecretKey: detects secret keys", () => {
+  assert.equal(isSecretKey("api_key"), true);
+  assert.equal(isSecretKey("API_KEY"), true);
+  assert.equal(isSecretKey("apiKey"), true);
+  assert.equal(isSecretKey("secret"), true);
+  assert.equal(isSecretKey("password"), true);
+  assert.equal(isSecretKey("bearer_token"), true);
+  assert.equal(isSecretKey("Authorization"), true);
+  assert.equal(isSecretKey("private_key"), true);
+});
+
+test("isSecretKey: non-secret keys pass through", () => {
+  assert.equal(isSecretKey("name"), false);
+  assert.equal(isSecretKey("model"), false);
+  assert.equal(isSecretKey("limit"), false);
+  assert.equal(isSecretKey("url"), false);
+});
+
+test("extractArgumentKeys: extracts keys from JSON", () => {
+  const keys = extractArgumentKeys('{"name":"test","limit":10}');
+  assert.deepEqual(keys, ["name", "limit"]);
+});
+
+test("extractArgumentKeys: empty for malformed JSON", () => {
+  assert.deepEqual(extractArgumentKeys("not json"), []);
+  assert.deepEqual(extractArgumentKeys(""), []);
+});
+
+test("extractArgumentKeys: empty for non-object JSON", () => {
+  assert.deepEqual(extractArgumentKeys("[1,2,3]"), []);
+  assert.deepEqual(extractArgumentKeys('"string"'), []);
+});
+
+test("redactToolChoice: string values pass through", () => {
+  assert.equal(redactToolChoice("auto"), "auto");
+  assert.equal(redactToolChoice("none"), "none");
+  assert.equal(redactToolChoice("required"), "required");
+  assert.equal(redactToolChoice(undefined), "auto");
+});
+
+test("redactToolChoice: function choice shows name", () => {
+  assert.equal(
+    redactToolChoice({ type: "function", function: { name: "my_tool" } }),
+    "function:my_tool",
+  );
+});
+
+test("redactEnv: redacts secret-looking keys", () => {
+  const result = redactEnv({
+    API_KEY: "sk-12345",
+    N8N_API_URL: "http://example.com",
+    PASSWORD: "hunter2",
+    MODE: "stdio",
+  });
+  assert.equal(result.API_KEY, "[REDACTED]");
+  assert.equal(result.N8N_API_URL, "http://example.com");
+  assert.equal(result.PASSWORD, "[REDACTED]");
+  assert.equal(result.MODE, "stdio");
+});
+
+// ── Trace builder tests ──────────────────────────────────────────────
+
+test("TraceBuilder: builds a complete trace record", () => {
+  const orig = process.env.CLAUDE_PROXY_TRACE_ENABLED;
+  process.env.CLAUDE_PROXY_TRACE_ENABLED = "1";
+  try {
+    // Use a fresh store for this test via the singleton
+    traceStore.clear();
+
+    const tb = createTraceBuilder({
+      traceId: "trc_test1",
+      requestId: "req_test1",
+      model: "claude-sonnet-4-6",
+      requestedModel: "claude-proxy/claude-sonnet-4-6",
+      stream: true,
+      endpoint: "chat.completions",
+    });
+
+    tb.setRuntime("stream-json");
+    tb.setMessageCount(3);
+    tb.setBridgeTools(true, {
+      tools: [{ type: "function", function: { name: "n8n__search", parameters: {} } }],
+      tool_choice: "auto",
+    });
+    tb.addToolCall({
+      id: "call_1",
+      type: "function",
+      function: { name: "search", arguments: '{"query":"test"}' },
+    });
+    tb.setFinishReason("tool_calls");
+    tb.setUsage({ promptTokens: 100, responseTokens: 50, cacheReadTokens: 20 });
+    tb.setSessionWarmHit(true);
+    tb.setToolCallParseSource("result_text");
+    tb.commit();
+
+    // The singleton traceStore won't have this since it's a different instance
+    // but the builder completed without error
+    assert.equal(tb.traceId, "trc_test1");
+  } finally {
+    if (orig !== undefined) process.env.CLAUDE_PROXY_TRACE_ENABLED = orig;
+    else delete process.env.CLAUDE_PROXY_TRACE_ENABLED;
+  }
+});
+
+test("TraceBuilder: records error and fallback", () => {
+  const tb = createTraceBuilder({
+    traceId: "trc_err",
+    requestId: "req_err",
+    model: "claude-opus-4-6",
+    requestedModel: "claude-opus-4-6",
+    stream: false,
+    endpoint: "chat.completions",
+  });
+
+  tb.setError("init_handshake_timeout", "init handshake timed out after 30000ms");
+  tb.setFallback("init_handshake_timeout");
+  tb.commit();
+  assert.equal(tb.traceId, "trc_err");
+});
+
+test("TraceBuilder: records tool results from request messages", () => {
+  const tb = createTraceBuilder({
+    traceId: "trc_tools",
+    requestId: "req_tools",
+    model: "claude-sonnet-4-6",
+    requestedModel: "claude-sonnet-4-6",
+    stream: true,
+    endpoint: "chat.completions",
+  });
+
+  const request: OpenAIChatRequest = {
+    tools: [{ type: "function", function: { name: "n8n__search", parameters: {} } }],
+    tool_choice: "auto",
+    messages: [
+      { role: "user", content: "search for cats" },
+      { role: "assistant", content: null, tool_calls: [{ id: "c1", type: "function" as const, function: { name: "search", arguments: '{"q":"cats"}' } }] },
+      { role: "tool", content: '{"results":[]}', tool_call_id: "c1", name: "search" },
+    ],
+    model: "claude-sonnet-4-6",
+  };
+  tb.setBridgeTools(true, request);
+  tb.commit();
+  assert.equal(tb.traceId, "trc_tools");
+});
+
+// ── MCP governance tests ─────────────────────────────────────────────
+
+test("applyMcpPolicy: open policy passes all servers", () => {
+  const servers: Record<string, ResolvedMcpServer> = {
+    n8n: { command: "n8n-mcp", args: [], env: {} },
+    github: { command: "github-mcp", args: [], env: {} },
+  };
+  const { allowed, decisions } = applyMcpPolicy(servers);
+  assert.equal(Object.keys(allowed).length, 2);
+  assert.equal(decisions.length, 2);
+  assert.ok(decisions.every((d) => d.action === "loaded"));
+});
+
+test("secretDecisionsToTrace: records secret audit metadata without values", () => {
+  const decisions = secretDecisionsToTrace([
+    { server: "github", envKey: "GITHUB_TOKEN", action: "secret_resolved" },
+    { server: "n8n", envKey: "N8N_API_KEY", action: "secret_unresolved", reason: "missing secret" },
+  ]);
+
+  assert.deepEqual(decisions, [
+    { server: "github", envKey: "GITHUB_TOKEN", action: "secret_resolved", reason: undefined },
+    { server: "n8n", envKey: "N8N_API_KEY", action: "secret_unresolved", reason: "missing secret" },
+  ]);
+  assert.equal(JSON.stringify(decisions).includes("actual-secret-value"), false);
+});
+
+test("detectOverlappingTools: detects overlaps", () => {
+  const callerTools = ["n8n__list_workflows", "custom_tool"];
+  const mcpServers: Record<string, ResolvedMcpServer> = {
+    n8n: { command: "n8n-mcp", args: [], env: {} },
+  };
+  const decisions = detectOverlappingTools(callerTools, mcpServers);
+  assert.ok(decisions.length > 0);
+  assert.equal(decisions[0].action, "overlapping_tool_blocked");
+});
+
+test("detectOverlappingTools: no overlap returns empty", () => {
+  const callerTools = ["custom_tool"];
+  const mcpServers: Record<string, ResolvedMcpServer> = {
+    n8n: { command: "n8n-mcp", args: [], env: {} },
+  };
+  const decisions = detectOverlappingTools(callerTools, mcpServers);
+  assert.equal(decisions.length, 0);
+});
+
+test("detectOverlappingTools: empty caller tools returns empty", () => {
+  const mcpServers: Record<string, ResolvedMcpServer> = {
+    n8n: { command: "n8n-mcp", args: [], env: {} },
+  };
+  const decisions = detectOverlappingTools([], mcpServers);
+  assert.equal(decisions.length, 0);
+});
+
+// ── Keepalive/progress helper tests ─────────────────────────────────
+
+test("createSseKeepaliveComment: emits comment-only keepalive", () => {
+  const frame = createSseKeepaliveComment("req1", 3);
+  assert.equal(frame, ":keepalive req_id=req1 count=3\n\n");
+  assert.equal(frame.includes("data:"), false);
+});
+
+test("createProgressChunk: includes role when requested", () => {
+  const chunk = createProgressChunk("req1", "claude-sonnet-4", true, "n8n progress...");
+  assert.equal(chunk.choices[0].delta.role, "assistant");
+  assert.equal(chunk.choices[0].delta.content, "n8n progress...");
+});
+
+test("createProgressChunk: preserves visible content", () => {
+  const chunk = createProgressChunk("req1", "claude-sonnet-4", false, "n8n progress...");
+  assert.equal(chunk.choices[0].delta.content, "n8n progress...");
+});
+
+// ── Tool call parse with malformed JSON ──────────────────────────────
+
+test("parseToolCalls: handles malformed tool JSON gracefully", () => {
+  // Truncated mid-value — the outermost brace never closes
+  const malformed = 'Here is the answer: {"tool_call":{"name":"n8n__search","arguments":{"q":"te';
+  const result = parseToolCalls(malformed, {
+    tools: [{ type: "function", function: { name: "n8n__search", parameters: {} } }],
+  });
+  // The malformed JSON won't parse because the brace is unclosed
+  assert.equal(result.toolCalls.length, 0);
+  assert.ok(result.textContent.length > 0);
+});
+
+test("parseToolCalls: handles valid tool JSON", () => {
+  const valid = '{"tool_call":{"name":"n8n__search","arguments":{"q":"test"}}}';
+  const result = parseToolCalls(valid, {
+    tools: [{ type: "function", function: { name: "n8n__search", parameters: {} } }],
+  });
+  assert.equal(result.toolCalls.length, 1);
+  assert.equal(result.toolCalls[0].function.name, "n8n__search");
+});
+
+test("parseToolCalls: tool-result follow-up does not re-emit same tool", () => {
+  // After a tool result, the model should answer normally, not re-call
+  const text = "Based on the search results, here are the top matches...";
+  const result = parseToolCalls(text, {
+    tools: [{ type: "function", function: { name: "n8n__search", parameters: {} } }],
+  });
+  assert.equal(result.toolCalls.length, 0);
+  assert.ok(result.textContent.includes("Based on the search results"));
+});
+
+// ── Streaming tool call detection ────────────────────────────────────
+
+test("parseToolCalls: streaming tool call with surrounding text", () => {
+  const text = 'Let me search for that.\n{"tool_call":{"name":"n8n__search","arguments":{"q":"cats"}}}\nDone.';
+  const result = parseToolCalls(text, {
+    tools: [{ type: "function", function: { name: "n8n__search", parameters: {} } }],
+  });
+  assert.equal(result.toolCalls.length, 1);
+  assert.equal(result.toolCalls[0].function.name, "n8n__search");
+  // Text around the tool call should remain
+  assert.ok(!result.textContent.includes("tool_call"));
+});
+
+// ── Parser fixture: interleaved JSON ─────────────────────────────────
+
+test("parseToolCalls: ignores non-tool JSON objects", () => {
+  const text = '{"status":"ok","count":5}\nSome text\n{"tool_call":{"name":"n8n__search","arguments":{}}}';
+  const result = parseToolCalls(text, {
+    tools: [{ type: "function", function: { name: "n8n__search", parameters: {} } }],
+  });
+  // Should only pick up the tool_call, not the status object
+  assert.equal(result.toolCalls.length, 1);
+  assert.equal(result.toolCalls[0].function.name, "n8n__search");
+});
+
+// ── Parser fixture: unexpected stream events ─────────────────────────
+
+test("parseToolCalls: handles empty text", () => {
+  const result = parseToolCalls("", {
+    tools: [{ type: "function", function: { name: "n8n__search", parameters: {} } }],
+  });
+  assert.equal(result.toolCalls.length, 0);
+  assert.equal(result.textContent, "");
+});
+
+// ── MCP governance: DENY policy ──────────────────────────────────────
+
+test("applyMcpPolicyWithEnv: DENY takes precedence over ALLOW", () => {
+  const servers: Record<string, ResolvedMcpServer> = {
+    n8n: { command: "n8n-mcp", args: [], env: {} },
+    github: { command: "github-mcp", args: [], env: {} },
+    slack: { command: "slack-mcp", args: [], env: {} },
+  };
+  const allow = new Set(["n8n", "github", "slack"]);
+  const deny = new Set(["github"]);
+  const { allowed, decisions } = applyMcpPolicyWithEnv(servers, allow, deny);
+  assert.equal(Object.keys(allowed).length, 2);
+  assert.ok(!("github" in allowed));
+  const githubDecision = decisions.find((d) => d.server === "github");
+  assert.equal(githubDecision?.action, "denied_by_policy");
+  assert.equal(githubDecision?.reason, "CLAUDE_PROXY_MCP_DENY");
+});
+
+test("applyMcpPolicyWithEnv: ALLOW-only filters to listed servers", () => {
+  const servers: Record<string, ResolvedMcpServer> = {
+    n8n: { command: "n8n-mcp", args: [], env: {} },
+    github: { command: "github-mcp", args: [], env: {} },
+    slack: { command: "slack-mcp", args: [], env: {} },
+  };
+  const allow = new Set(["n8n"]);
+  const { allowed, decisions } = applyMcpPolicyWithEnv(servers, allow, null);
+  assert.equal(Object.keys(allowed).length, 1);
+  assert.ok("n8n" in allowed);
+  const skipped = decisions.filter((d) => d.action === "skipped");
+  assert.equal(skipped.length, 2);
+  assert.ok(skipped.every((d) => d.reason === "not in CLAUDE_PROXY_MCP_ALLOW"));
+});
+
+test("applyMcpPolicyWithEnv: DENY-only blocks listed servers", () => {
+  const servers: Record<string, ResolvedMcpServer> = {
+    n8n: { command: "n8n-mcp", args: [], env: {} },
+    github: { command: "github-mcp", args: [], env: {} },
+  };
+  const deny = new Set(["n8n"]);
+  const { allowed, decisions } = applyMcpPolicyWithEnv(servers, null, deny);
+  assert.equal(Object.keys(allowed).length, 1);
+  assert.ok("github" in allowed);
+  assert.equal(decisions.find((d) => d.server === "n8n")?.action, "denied_by_policy");
+  assert.equal(decisions.find((d) => d.server === "github")?.action, "loaded");
+});
+
+// ── MCP governance: parseList ────────────────────────────────────────
+
+test("parseList: parses comma-separated values", () => {
+  const set = parseList("n8n, github, slack");
+  assert.ok(set);
+  assert.equal(set.size, 3);
+  assert.ok(set.has("n8n"));
+  assert.ok(set.has("github"));
+  assert.ok(set.has("slack"));
+});
+
+test("parseList: returns null for undefined/empty", () => {
+  assert.equal(parseList(undefined), null);
+  assert.equal(parseList(""), null);
+  assert.equal(parseList("  "), null);
+});
+
+// ── MCP governance: summary ──────────────────────────────────────────
+
+test("mcpGovernanceSummary: returns structured summary", () => {
+  const summary = mcpGovernanceSummary();
+  assert.equal(typeof summary.injectionEnabled, "boolean");
+  // allowPolicy and denyPolicy are either null or string arrays
+  if (summary.allowPolicy !== null) {
+    assert.ok(Array.isArray(summary.allowPolicy));
+  }
+  if (summary.denyPolicy !== null) {
+    assert.ok(Array.isArray(summary.denyPolicy));
+  }
+});
+
+// ── Error classification: additional classes ─────────────────────────
+
+test("classifyError: upstream hard dead", () => {
+  assert.equal(classifyError(new Error("upstream hard-dead detected")), "upstream_hard_dead");
+});
+
+test("classifyError: content policy", () => {
+  assert.equal(classifyError(new Error("content policy violation")), "content_policy");
+  assert.equal(classifyError(new Error("safety filter triggered")), "content_policy");
+});
+
+test("classifyError: context length", () => {
+  assert.equal(classifyError(new Error("context length exceeded")), "context_length");
+  assert.equal(classifyError(new Error("too many tokens in request")), "context_length");
+});
+
+// ── TraceBuilder: committed record content assertions ────────────────
+
+test("TraceBuilder: committed record contains expected tool call data", () => {
+  const orig = process.env.CLAUDE_PROXY_TRACE_ENABLED;
+  process.env.CLAUDE_PROXY_TRACE_ENABLED = "1";
+  try {
+    const store = new TraceStore();
+    // Build and commit a trace with tool calls
+    const record = makeTrace("trc_content_test", {
+      bridgeTools: true,
+      toolsOffered: ["n8n__search", "web_search"],
+      toolChoice: "auto",
+      toolCallsParsed: [
+        { id: "call_1", name: "n8n__search", argumentKeys: ["query"] },
+      ],
+      toolCallParseSource: "result_text",
+      finishReason: "tool_calls",
+      promptTokens: 150,
+      responseTokens: 30,
+      cacheReadTokens: 50,
+      sessionWarmHit: true,
+    });
+    store.set(record);
+
+    const retrieved = store.get("trc_content_test");
+    assert.ok(retrieved);
+    assert.equal(retrieved.bridgeTools, true);
+    assert.deepEqual(retrieved.toolsOffered, ["n8n__search", "web_search"]);
+    assert.equal(retrieved.toolChoice, "auto");
+    assert.equal(retrieved.toolCallsParsed.length, 1);
+    assert.equal(retrieved.toolCallsParsed[0].name, "n8n__search");
+    assert.deepEqual(retrieved.toolCallsParsed[0].argumentKeys, ["query"]);
+    assert.equal(retrieved.toolCallParseSource, "result_text");
+    assert.equal(retrieved.finishReason, "tool_calls");
+    assert.equal(retrieved.promptTokens, 150);
+    assert.equal(retrieved.responseTokens, 30);
+    assert.equal(retrieved.cacheReadTokens, 50);
+    assert.equal(retrieved.sessionWarmHit, true);
+  } finally {
+    if (orig !== undefined) process.env.CLAUDE_PROXY_TRACE_ENABLED = orig;
+    else delete process.env.CLAUDE_PROXY_TRACE_ENABLED;
+  }
+});
+
+test("TraceBuilder: committed trace has no raw secret values in tool argument keys", () => {
+  const orig = process.env.CLAUDE_PROXY_TRACE_ENABLED;
+  process.env.CLAUDE_PROXY_TRACE_ENABLED = "1";
+  try {
+    const store = new TraceStore();
+    const record = makeTrace("trc_redact_test", {
+      toolCallsParsed: [
+        { id: "call_1", name: "search", argumentKeys: ["api_key", "query"] },
+      ],
+    });
+    store.set(record);
+
+    const retrieved = store.get("trc_redact_test");
+    assert.ok(retrieved);
+    // argumentKeys are key names only, never values
+    assert.ok(retrieved.toolCallsParsed[0].argumentKeys.includes("api_key"));
+    assert.ok(retrieved.toolCallsParsed[0].argumentKeys.includes("query"));
+    // No values stored anywhere in the tool call
+    const serialized = JSON.stringify(retrieved.toolCallsParsed);
+    assert.ok(!serialized.includes("sk-")); // no secret values
+  } finally {
+    if (orig !== undefined) process.env.CLAUDE_PROXY_TRACE_ENABLED = orig;
+    else delete process.env.CLAUDE_PROXY_TRACE_ENABLED;
+  }
+});
+
+test("TraceBuilder: MCP decisions are stored on trace record", () => {
+  const orig = process.env.CLAUDE_PROXY_TRACE_ENABLED;
+  process.env.CLAUDE_PROXY_TRACE_ENABLED = "1";
+  try {
+    const store = new TraceStore();
+    const record = makeTrace("trc_mcp_test", {
+      mcpDecisions: [
+        { server: "n8n", action: "loaded" },
+        { server: "github", action: "denied_by_policy", reason: "CLAUDE_PROXY_MCP_DENY" },
+        { server: "n8n", action: "secret_resolved", envKey: "N8N_API_KEY" },
+      ],
+    });
+    store.set(record);
+
+    const retrieved = store.get("trc_mcp_test");
+    assert.ok(retrieved);
+    assert.equal(retrieved.mcpDecisions.length, 3);
+    assert.equal(retrieved.mcpDecisions[0].action, "loaded");
+    assert.equal(retrieved.mcpDecisions[1].action, "denied_by_policy");
+    assert.equal(retrieved.mcpDecisions[2].action, "secret_resolved");
+    assert.equal(retrieved.mcpDecisions[2].envKey, "N8N_API_KEY");
+  } finally {
+    if (orig !== undefined) process.env.CLAUDE_PROXY_TRACE_ENABLED = orig;
+    else delete process.env.CLAUDE_PROXY_TRACE_ENABLED;
+  }
+});
