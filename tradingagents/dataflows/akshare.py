@@ -118,6 +118,81 @@ def _yyyymmdd(date_str: str) -> str:
     return date_str.replace("-", "")
 
 
+def _tx_symbol(ticker: str) -> str:
+    """`002714.SZ`/`000001` → `sz002714`, `600519.SS` → `sh600519` for the
+    Tencent (stock_zh_a_hist_tx) API, which wants a lowercase exchange prefix."""
+    up = ticker.upper()
+    if up.endswith(".SZ"):
+        return "sz" + up[:-3]
+    if up.endswith(".SS"):
+        return "sh" + up[:-3]
+    if up.endswith(".BJ"):
+        return "bj" + up[:-3]
+    code = up
+    # Bare 6-digit code: infer exchange from the leading digit.
+    # 6xxxxx → Shanghai; 0/3xxxxx → Shenzhen; 8/4xxxxx → Beijing.
+    if code.startswith("6"):
+        return "sh" + code
+    if code.startswith(("0", "3")):
+        return "sz" + code
+    if code.startswith(("8", "4")):
+        return "bj" + code
+    return "sz" + code
+
+
+def _fetch_a_share_ohlcv(symbol: str, start_yyyymmdd: str, end_yyyymmdd: str) -> pd.DataFrame:
+    """Fetch A-share daily OHLCV, returning a DataFrame with English columns
+    Date/Open/High/Low/Close/Volume.
+
+    Source order: Tencent (stock_zh_a_hist_tx) FIRST, EastMoney
+    (stock_zh_a_hist) as fallback. EastMoney rate-limits aggressively by IP
+    (a single analyst run fires ~7 indicator calls in the same second, which
+    trips the limiter and the whole run dies with ConnectionError). Tencent is
+    an independent backend not subject to that limiter. Tencent omits a true
+    volume column (only `amount`), so we map amount→Volume there; the headline
+    indicators (SMA/EMA/RSI/MACD/Bollinger/ATR) don't use volume, and the
+    EastMoney fallback still carries the real volume when it is reachable.
+    """
+    # Primary: Tencent
+    try:
+        df = _retry(
+            ak.stock_zh_a_hist_tx,
+            symbol=_tx_symbol(symbol),
+            start_date=start_yyyymmdd,
+            end_date=end_yyyymmdd,
+            adjust="qfq",
+        )
+        if df is not None and not df.empty:
+            df = df.rename(columns={
+                "date": "Date", "open": "Open", "close": "Close",
+                "high": "High", "low": "Low", "amount": "Volume",
+            })
+            for col in ("Open", "High", "Low", "Close", "Volume"):
+                if col not in df.columns:
+                    df[col] = pd.NA
+            return df[["Date", "Open", "High", "Low", "Close", "Volume"]]
+    except Exception as e:
+        logger.warning("Tencent A-share fetch failed for %s (%s); falling back to EastMoney",
+                       symbol, type(e).__name__)
+
+    # Fallback: EastMoney (has real volume when reachable)
+    df = _retry(
+        ak.stock_zh_a_hist,
+        symbol=_strip_suffix(symbol),
+        period="daily",
+        start_date=start_yyyymmdd,
+        end_date=end_yyyymmdd,
+        adjust="qfq",
+    )
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["Date", "Open", "High", "Low", "Close", "Volume"])
+    df = df.rename(columns={
+        "日期": "Date", "开盘": "Open", "收盘": "Close",
+        "最高": "High", "最低": "Low", "成交量": "Volume", "成交额": "Amount",
+    })
+    return df[["Date", "Open", "High", "Low", "Close", "Volume"]]
+
+
 _HK_COL_MAP = {
     "日期": "Date", "开盘": "Open", "收盘": "Close",
     "最高": "High", "最低": "Low", "成交量": "Volume", "成交额": "Amount",
@@ -154,40 +229,19 @@ def get_stock_data(symbol: str, start_date: str, end_date: str) -> str:
     """OHLCV for an A-share or HK stock over a date range, like yfinance's CSV."""
     if is_hk_share(symbol):
         return _get_stock_data_hk(symbol, start_date, end_date)
-    code = _strip_suffix(symbol)
-    df = _retry(
-        ak.stock_zh_a_hist,
-        symbol=code,
-        period="daily",
-        start_date=_yyyymmdd(start_date),
-        end_date=_yyyymmdd(end_date),
-        adjust="qfq",  # forward-adjusted; matches yfinance auto_adjust default
-    )
+    df = _fetch_a_share_ohlcv(symbol, _yyyymmdd(start_date), _yyyymmdd(end_date))
     if df.empty:
         return f"No data found for symbol '{symbol}' between {start_date} and {end_date}"
 
-    # Map Chinese columns → the English names yfinance returns, so
-    # downstream callers (stockstats, prompt templates) see one shape.
-    df = df.rename(columns={
-        "日期": "Date",
-        "开盘": "Open",
-        "收盘": "Close",
-        "最高": "High",
-        "最低": "Low",
-        "成交量": "Volume",
-        "成交额": "Amount",
-        "涨跌幅": "PctChange",
-    })
-    df = df[["Date", "Open", "High", "Low", "Close", "Volume"]]
     df = df.set_index("Date")
     for col in ("Open", "High", "Low", "Close"):
-        df[col] = df[col].round(2)
+        df[col] = pd.to_numeric(df[col], errors="coerce").round(2)
 
     csv_string = df.to_csv()
     header = (
         f"# Stock data for {symbol.upper()} from {start_date} to {end_date}\n"
         f"# Total records: {len(df)}\n"
-        f"# Source: AKShare (eastmoney) / Adjusted: forward (qfq)\n"
+        f"# Source: AKShare (tencent primary, eastmoney fallback) / Adjusted: forward (qfq)\n"
         f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
     )
     return header + csv_string
@@ -211,19 +265,17 @@ def _load_ohlcv_for_indicators(symbol: str, curr_date: str) -> pd.DataFrame:
             end_date=end_dt.strftime("%Y%m%d"),
             adjust="",
         )
+        df = df.rename(columns={
+            "日期": "Date", "开盘": "Open", "收盘": "Close",
+            "最高": "High", "最低": "Low", "成交量": "Volume",
+        })
     else:
-        df = _retry(
-            ak.stock_zh_a_hist,
-            symbol=_strip_suffix(symbol),
-            period="daily",
-            start_date=start_dt.strftime("%Y%m%d"),
-            end_date=end_dt.strftime("%Y%m%d"),
-            adjust="qfq",
+        # Tencent-primary / EastMoney-fallback; already English columns.
+        df = _fetch_a_share_ohlcv(
+            symbol, start_dt.strftime("%Y%m%d"), end_dt.strftime("%Y%m%d")
         )
-    df = df.rename(columns={
-        "日期": "Date", "开盘": "Open", "收盘": "Close",
-        "最高": "High", "最低": "Low", "成交量": "Volume",
-    })
+    if df.empty:
+        return df
     df["Date"] = pd.to_datetime(df["Date"])
     df = df[df["Date"] <= end_dt]
     df = df[["Date", "Open", "High", "Low", "Close", "Volume"]]
