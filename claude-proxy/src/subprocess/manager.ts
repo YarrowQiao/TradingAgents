@@ -9,7 +9,7 @@ import { spawn, ChildProcess } from "child_process";
 import { EventEmitter } from "events";
 import fs from "fs/promises";
 import path from "path";
-import { resolveClaudeCommand } from "./cli-resolver.js";
+import { resolveClaudeCommand, neutralCwd } from "./cli-resolver.js";
 import type {
   ClaudeCliMessage,
   ClaudeCliAssistant,
@@ -57,7 +57,7 @@ export class ClaudeSubprocess extends EventEmitter {
     return new Promise((resolve, reject) => {
       try {
         this.process = spawn(resolveClaudeCommand(), args, {
-          cwd: options.cwd || process.cwd(),
+          cwd: options.cwd || neutralCwd(),
           env: { ...process.env, OPENCLAW_PROXY: "1" },
           stdio: ["pipe", "pipe", "pipe"],
         });

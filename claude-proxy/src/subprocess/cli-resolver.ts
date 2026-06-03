@@ -9,8 +9,9 @@
  *
  * Override with CLAUDE_PROXY_CLI_PATH if the auto-resolver guesses wrong.
  */
-import { existsSync } from "node:fs";
+import { existsSync, mkdtempSync } from "node:fs";
 import { join } from "node:path";
+import { tmpdir } from "node:os";
 
 let cached: string | null = null;
 
@@ -65,4 +66,29 @@ export function resolveClaudeCommand(): string {
 
   cached = "claude";
   return cached;
+}
+
+let cachedNeutralCwd: string | null = null;
+
+/**
+ * A neutral, empty working directory for spawned `claude` subprocesses.
+ *
+ * Without this the subprocess inherits the proxy's own `process.cwd()` — i.e.
+ * the claude-proxy project directory. Claude Code then auto-loads that dir's
+ * `CLAUDE.md` and `.claude/settings*`, so the model thinks it is "working in
+ * the claude-proxy project" and blends those software-engineering instructions
+ * into whatever the API caller actually requested (e.g. a stock-analyst
+ * persona). The result is the "conflicting system messages" confusion where
+ * the model stops and asks for clarification instead of answering.
+ *
+ * An empty temp dir has no CLAUDE.md, no `.claude/`, and is not a git repo, so
+ * no project context leaks in. Created once and reused for the process
+ * lifetime. Override with CLAUDE_PROXY_CWD if a specific dir is needed.
+ */
+export function neutralCwd(): string {
+  const override = process.env.CLAUDE_PROXY_CWD;
+  if (override) return override;
+  if (cachedNeutralCwd) return cachedNeutralCwd;
+  cachedNeutralCwd = mkdtempSync(join(tmpdir(), "claude-proxy-cwd-"));
+  return cachedNeutralCwd;
 }

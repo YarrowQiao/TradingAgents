@@ -39,7 +39,7 @@ import { applyMcpPolicy, secretDecisionsToTrace } from "../mcp/governance.js";
 import type { TraceMcpDecision } from "../trace/types.js";
 import { parseStreamJsonLine } from "./stream-json-parser.js";
 import { pushClaudeFlagIfSupported } from "./claude-flags.js";
-import { resolveClaudeCommand } from "./cli-resolver.js";
+import { resolveClaudeCommand, neutralCwd } from "./cli-resolver.js";
 import {
   detectIntentionalWaitFromMessage,
   detectIntentionalWaitFromResult,
@@ -189,7 +189,10 @@ export class StreamJsonSubprocess extends EventEmitter {
 
     return new Promise((resolve, reject) => {
       this.process = spawn(resolveClaudeCommand(), args, {
-        cwd: options.cwd || process.cwd(),
+        // Neutral empty dir, NOT process.cwd() — otherwise the inner claude
+        // loads the claude-proxy project's CLAUDE.md/.claude and corrupts the
+        // caller's persona. See neutralCwd() docs.
+        cwd: options.cwd || neutralCwd(),
         env: { ...process.env, OPENCLAW_PROXY: "1" },
         stdio: ["pipe", "pipe", "pipe"],
       });
