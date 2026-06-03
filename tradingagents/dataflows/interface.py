@@ -28,6 +28,7 @@ from .alpha_vantage_common import AlphaVantageRateLimitError
 # akshare.py runs at module load, before any A-share request fires.
 from .akshare import (
     is_a_share,
+    is_hk_share,
     get_stock_data as get_akshare_stock,
     get_indicators as get_akshare_indicators,
     get_fundamentals as get_akshare_fundamentals,

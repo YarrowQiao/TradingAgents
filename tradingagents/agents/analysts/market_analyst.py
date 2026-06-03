@@ -4,6 +4,7 @@ from tradingagents.agents.utils.agent_utils import (
     get_indicators,
     get_language_instruction,
     get_stock_data,
+    invoke_analyst_with_retry,
 )
 from tradingagents.dataflows.config import get_config
 
@@ -76,7 +77,7 @@ Volume-Based Indicators:
 
         chain = prompt | llm.bind_tools(tools)
 
-        result = chain.invoke(state["messages"])
+        result = invoke_analyst_with_retry(chain, state["messages"])
 
         report = ""
 

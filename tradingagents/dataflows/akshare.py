@@ -49,6 +49,7 @@ logger = logging.getLogger(__name__)
 
 # Suffix detection — exported so route_to_vendor can use the same rule.
 A_SHARE_SUFFIXES = (".SZ", ".SS", ".BJ")
+HK_SHARE_SUFFIXES = (".HK",)
 
 
 def _retry(fn: Callable, *args, retries: int = 3, base_delay: float = 1.5, **kwargs):
@@ -88,6 +89,18 @@ def _strip_suffix(ticker: str) -> str:
     return up
 
 
+def is_hk_share(ticker: str) -> bool:
+    return ticker.upper().endswith(HK_SHARE_SUFFIXES)
+
+
+def _hk_code(ticker: str) -> str:
+    """`09992.HK` / `9992.HK` → `09992` — the 5-digit code AKShare's HK APIs want."""
+    up = ticker.upper()
+    if up.endswith(".HK"):
+        up = up[:-3]
+    return up.zfill(5)
+
+
 def _em_prefixed_symbol(ticker: str) -> str:
     """`002714.SZ` → `SZ002714`, `600519.SS` → `SH600519` for EM financial APIs."""
     up = ticker.upper()
@@ -105,8 +118,42 @@ def _yyyymmdd(date_str: str) -> str:
     return date_str.replace("-", "")
 
 
+_HK_COL_MAP = {
+    "日期": "Date", "开盘": "Open", "收盘": "Close",
+    "最高": "High", "最低": "Low", "成交量": "Volume", "成交额": "Amount",
+}
+
+
+def _get_stock_data_hk(symbol: str, start_date: str, end_date: str) -> str:
+    """OHLCV for a HK-listed stock (e.g. 09992.HK), formatted like get_stock_data."""
+    code = _hk_code(symbol)
+    df = _retry(
+        ak.stock_hk_hist,
+        symbol=code,
+        period="daily",
+        start_date=_yyyymmdd(start_date),
+        end_date=_yyyymmdd(end_date),
+        adjust="",  # HK adjusted series are spotty on eastmoney; use raw
+    )
+    if df is None or df.empty:
+        return f"No data found for symbol '{symbol}' between {start_date} and {end_date}"
+    df = df.rename(columns=_HK_COL_MAP)
+    df = df[["Date", "Open", "High", "Low", "Close", "Volume"]].set_index("Date")
+    for col in ("Open", "High", "Low", "Close"):
+        df[col] = df[col].round(3)
+    header = (
+        f"# Stock data for {symbol.upper()} from {start_date} to {end_date}\n"
+        f"# Total records: {len(df)}\n"
+        f"# Source: AKShare HK (eastmoney) / Adjusted: none\n"
+        f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+    )
+    return header + df.to_csv()
+
+
 def get_stock_data(symbol: str, start_date: str, end_date: str) -> str:
-    """OHLCV for an A-share over a date range, formatted like yfinance's CSV."""
+    """OHLCV for an A-share or HK stock over a date range, like yfinance's CSV."""
+    if is_hk_share(symbol):
+        return _get_stock_data_hk(symbol, start_date, end_date)
     code = _strip_suffix(symbol)
     df = _retry(
         ak.stock_zh_a_hist,
@@ -153,17 +200,26 @@ def _load_ohlcv_for_indicators(symbol: str, curr_date: str) -> pd.DataFrame:
     have plenty of points before the lookback window. Larger windows
     were getting rejected by eastmoney as bot-like burst traffic.
     """
-    code = _strip_suffix(symbol)
     end_dt = datetime.strptime(curr_date, "%Y-%m-%d")
     start_dt = end_dt - pd.DateOffset(years=1)
-    df = _retry(
-        ak.stock_zh_a_hist,
-        symbol=code,
-        period="daily",
-        start_date=start_dt.strftime("%Y%m%d"),
-        end_date=end_dt.strftime("%Y%m%d"),
-        adjust="qfq",
-    )
+    if is_hk_share(symbol):
+        df = _retry(
+            ak.stock_hk_hist,
+            symbol=_hk_code(symbol),
+            period="daily",
+            start_date=start_dt.strftime("%Y%m%d"),
+            end_date=end_dt.strftime("%Y%m%d"),
+            adjust="",
+        )
+    else:
+        df = _retry(
+            ak.stock_zh_a_hist,
+            symbol=_strip_suffix(symbol),
+            period="daily",
+            start_date=start_dt.strftime("%Y%m%d"),
+            end_date=end_dt.strftime("%Y%m%d"),
+            adjust="qfq",
+        )
     df = df.rename(columns={
         "日期": "Date", "开盘": "Open", "收盘": "Close",
         "最高": "High", "最低": "Low", "成交量": "Volume",
@@ -214,6 +270,12 @@ def get_indicators(symbol: str, indicator: str, curr_date: str, look_back_days: 
 
 def get_news(ticker: str, start_date: str, end_date: str) -> str:
     """Per-ticker news from EastMoney, filtered to the date range."""
+    if is_hk_share(ticker):
+        return (
+            f"Per-ticker news for HK stocks ({ticker}) is not available from the "
+            f"current AKShare/EastMoney per-ticker feed (it covers mainland "
+            f"A-shares only). Use macro/sector news for HK names."
+        )
     code = _strip_suffix(ticker)
     df = _retry(ak.stock_news_em, symbol=code)
     if df.empty:
@@ -306,11 +368,33 @@ def get_global_news(curr_date: str, look_back_days: Optional[int] = None, limit:
     return "\n".join(lines)
 
 
+def _get_fundamentals_hk(ticker: str, curr_date: str) -> str:
+    """HK fundamentals via EastMoney HK financial-analysis indicators.
+
+    Column names vary across akshare versions, so render generically rather
+    than assuming a fixed schema — an upstream rename can't silently break it.
+    """
+    code = _hk_code(ticker)
+    try:
+        df = _retry(ak.stock_financial_hk_analysis_indicator_em, symbol=code, indicator="年度")
+    except Exception as e:
+        return f"Fundamentals fetch failed for {ticker} (HK): {e}"
+    if df is None or df.empty:
+        return f"No fundamentals available for {ticker} (HK)"
+    return (
+        f"# Fundamentals for {ticker} (HK) as of {curr_date}\n"
+        f"# Source: 东方财富 港股财务分析指标 (年度) via AKShare\n\n"
+        + df.head(8).to_string(index=False)
+    )
+
+
 def get_fundamentals(ticker: str, curr_date: str) -> str:
-    """Summary fundamentals — uses Tonghuashun financial abstract.
+    """Summary fundamentals — Tonghuashun (A-share) or EastMoney HK indicators.
 
     Returns the latest reporting period plus YoY context.
     """
+    if is_hk_share(ticker):
+        return _get_fundamentals_hk(ticker, curr_date)
     code = _strip_suffix(ticker)
     try:
         df = _retry(ak.stock_financial_abstract_ths, symbol=code)

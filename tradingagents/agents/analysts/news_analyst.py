@@ -4,6 +4,7 @@ from tradingagents.agents.utils.agent_utils import (
     get_global_news,
     get_language_instruction,
     get_news,
+    invoke_analyst_with_retry,
 )
 from tradingagents.dataflows.config import get_config
 
@@ -24,6 +25,7 @@ def create_news_analyst(llm):
 
         system_message = (
             f"You are a news researcher tasked with analyzing recent news and trends over the past week. Please write a comprehensive report of the current state of the world that is relevant for trading and macroeconomics. Use the available tools: get_news(query, start_date, end_date) for {asset_label}-specific or targeted news searches, and get_global_news(curr_date, look_back_days, limit) for broader macroeconomic news. Provide specific, actionable insights with supporting evidence to help traders make informed decisions."
+            + " CRITICAL: You MUST call get_global_news (and get_news where relevant) to obtain the data BEFORE writing anything — the tools return live data and ARE available. Do NOT claim the tools are unavailable, and do NOT mention your training-knowledge cutoff: the analysis date is intentionally current and the tools supply the up-to-date information, so your knowledge cutoff is irrelevant. Never refuse or ask the user to verify/enable tools; always make the tool calls and then write the report from the returned data."
             + """ Make sure to append a Markdown table at the end of the report to organize key points in the report, organized and easy to read."""
             + get_language_instruction()
         )
@@ -51,7 +53,7 @@ def create_news_analyst(llm):
         prompt = prompt.partial(instrument_context=instrument_context)
 
         chain = prompt | llm.bind_tools(tools)
-        result = chain.invoke(state["messages"])
+        result = invoke_analyst_with_retry(chain, state["messages"])
 
         report = ""
 

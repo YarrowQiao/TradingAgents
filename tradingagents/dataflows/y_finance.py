@@ -6,6 +6,22 @@ import yfinance as yf
 import os
 from .stockstats_utils import StockstatsUtils, _clean_dataframe, yf_retry, load_ohlcv, filter_financials_by_date
 
+
+def _yahoo_symbol(symbol: str) -> str:
+    """Normalize a ticker for Yahoo Finance.
+
+    HK tickers arrive as e.g. ``09992.HK`` but Yahoo expects a 4-digit
+    code (``9992.HK``): strip leading zeros, then zero-pad back to 4.
+    Non-HK tickers are returned upper-cased, unchanged — so US tickers
+    and A-shares routed here behave exactly as before.
+    """
+    up = symbol.upper()
+    if up.endswith(".HK"):
+        code = up[:-3].lstrip("0").zfill(4)
+        return f"{code}.HK"
+    return up
+
+
 def get_YFin_data_online(
     symbol: Annotated[str, "ticker symbol of the company"],
     start_date: Annotated[str, "Start date in yyyy-mm-dd format"],
@@ -16,7 +32,7 @@ def get_YFin_data_online(
     datetime.strptime(end_date, "%Y-%m-%d")
 
     # Create ticker object
-    ticker = yf.Ticker(symbol.upper())
+    ticker = yf.Ticker(_yahoo_symbol(symbol))
 
     # Fetch historical data for the specified date range
     data = yf_retry(lambda: ticker.history(start=start_date, end=end_date))
@@ -251,7 +267,7 @@ def get_fundamentals(
 ):
     """Get company fundamentals overview from yfinance."""
     try:
-        ticker_obj = yf.Ticker(ticker.upper())
+        ticker_obj = yf.Ticker(_yahoo_symbol(ticker))
         info = yf_retry(lambda: ticker_obj.info)
 
         if not info:
@@ -309,7 +325,7 @@ def get_balance_sheet(
 ):
     """Get balance sheet data from yfinance."""
     try:
-        ticker_obj = yf.Ticker(ticker.upper())
+        ticker_obj = yf.Ticker(_yahoo_symbol(ticker))
 
         if freq.lower() == "quarterly":
             data = yf_retry(lambda: ticker_obj.quarterly_balance_sheet)
@@ -341,7 +357,7 @@ def get_cashflow(
 ):
     """Get cash flow data from yfinance."""
     try:
-        ticker_obj = yf.Ticker(ticker.upper())
+        ticker_obj = yf.Ticker(_yahoo_symbol(ticker))
 
         if freq.lower() == "quarterly":
             data = yf_retry(lambda: ticker_obj.quarterly_cashflow)
@@ -373,7 +389,7 @@ def get_income_statement(
 ):
     """Get income statement data from yfinance."""
     try:
-        ticker_obj = yf.Ticker(ticker.upper())
+        ticker_obj = yf.Ticker(_yahoo_symbol(ticker))
 
         if freq.lower() == "quarterly":
             data = yf_retry(lambda: ticker_obj.quarterly_income_stmt)
@@ -403,7 +419,7 @@ def get_insider_transactions(
 ):
     """Get insider transactions data from yfinance."""
     try:
-        ticker_obj = yf.Ticker(ticker.upper())
+        ticker_obj = yf.Ticker(_yahoo_symbol(ticker))
         data = yf_retry(lambda: ticker_obj.insider_transactions)
         
         if data is None or data.empty:

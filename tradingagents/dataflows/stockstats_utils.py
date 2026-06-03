@@ -74,8 +74,11 @@ def load_ohlcv(symbol: str, curr_date: str) -> pd.DataFrame:
     if os.path.exists(data_file):
         data = pd.read_csv(data_file, on_bad_lines="skip", encoding="utf-8")
     else:
+        # Normalize HK tickers (09992.HK -> 9992.HK) for Yahoo. Lazy import
+        # avoids a circular import (y_finance imports from this module at load).
+        from .y_finance import _yahoo_symbol
         data = yf_retry(lambda: yf.download(
-            symbol,
+            _yahoo_symbol(symbol),
             start=start_str,
             end=end_str,
             multi_level_index=False,
