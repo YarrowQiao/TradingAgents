@@ -29,6 +29,7 @@ from .alpha_vantage_common import AlphaVantageRateLimitError
 from .akshare import (
     is_a_share,
     is_hk_share,
+    normalize_ticker,
     get_stock_data as get_akshare_stock,
     get_indicators as get_akshare_indicators,
     get_fundamentals as get_akshare_fundamentals,
@@ -147,6 +148,22 @@ def _ticker_from_args(method: str, args, kwargs):
         return args[0]
     return kwargs.get("symbol") or kwargs.get("ticker")
 
+def _rewrite_ticker(args, kwargs, new_ticker):
+    """Put ``new_ticker`` back wherever ``_ticker_from_args`` found it.
+
+    Mirrors the positional-first / symbol-or-ticker-kwarg lookup so the
+    normalized ticker reaches every downstream vendor impl, not just the
+    routing decision.
+    """
+    if args:
+        return (new_ticker,) + tuple(args[1:]), kwargs
+    kwargs = dict(kwargs)
+    if "symbol" in kwargs:
+        kwargs["symbol"] = new_ticker
+    elif "ticker" in kwargs:
+        kwargs["ticker"] = new_ticker
+    return args, kwargs
+
 def get_category_for_method(method: str) -> str:
     """Get the category that contains the specified method."""
     for category, info in TOOLS_CATEGORIES.items():
@@ -196,6 +213,15 @@ def route_to_vendor(method: str, *args, **kwargs):
     # original chain is preserved exactly — this is the safety guarantee
     # the user asked for ("不影响美股分析").
     ticker = _ticker_from_args(method, args, kwargs)
+
+    # Normalize manual suffix aliases (e.g. .SH→.SS) before routing so the
+    # decision and every downstream vendor impl see the canonical ticker.
+    if ticker:
+        normalized = normalize_ticker(ticker)
+        if normalized != ticker:
+            args, kwargs = _rewrite_ticker(args, kwargs, normalized)
+            ticker = normalized
+
     if ticker and is_a_share(ticker) and "akshare" in VENDOR_METHODS[method]:
         fallback_vendors = ["akshare"] + [v for v in fallback_vendors if v != "akshare"]
 

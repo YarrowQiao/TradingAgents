@@ -76,6 +76,28 @@ def _retry(fn: Callable, *args, retries: int = 3, base_delay: float = 1.5, **kwa
             time.sleep(delay)
 
 
+# Common manual suffix aliases → the canonical suffix this codebase routes
+# on. Users (and EastMoney-style notation) frequently spell Shanghai as
+# ".SH", but yfinance and akshare both expect ".SS". Normalizing here means
+# both spellings work everywhere without touching every call site.
+_SUFFIX_ALIASES = {".SH": ".SS"}
+
+
+def normalize_ticker(ticker: str) -> str:
+    """Map manual suffix aliases (e.g. ``600528.SH`` → ``600528.SS``).
+
+    Returns the ticker unchanged when no alias matches, so US/HK/bare codes
+    are untouched.
+    """
+    if not ticker:
+        return ticker
+    up = ticker.upper()
+    for alias, canonical in _SUFFIX_ALIASES.items():
+        if up.endswith(alias):
+            return up[: -len(alias)] + canonical
+    return ticker
+
+
 def is_a_share(ticker: str) -> bool:
     return ticker.upper().endswith(A_SHARE_SUFFIXES)
 

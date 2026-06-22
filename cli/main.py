@@ -780,8 +780,8 @@ def _convert_md_to_pdf(md_path: Path) -> Optional[Path]:
             str(md_path),
             "-o", str(pdf_path),
             "--pdf-engine=xelatex",
-            "-V", "CJKmainfont=Microsoft YaHei",
-            "-V", "mainfont=Microsoft YaHei",
+            "-V", "CJKmainfont=Noto Sans CJK SC",
+            "-V", "mainfont=Noto Sans CJK SC",
             "-V", "geometry:margin=2cm",
             "--include-in-header", header_name,
         ]
